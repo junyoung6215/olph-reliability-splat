@@ -1,0 +1,143 @@
+defaults:
+  - model/encoder: noposplat
+  - model/decoder: splatting_cuda
+  - loss: [mse, geo]
+
+wandb:
+  project: noposplat
+  entity: scene-representation-group
+  name: placeholder
+  mode: disabled
+
+mode: train
+
+model:
+  anchor_selection:
+    enabled: false
+    method: none
+    apply_to: test
+    renormalize_cameras: true
+    allow_unsafe_reorder: false
+    debug_save_scores: false
+    vggt_cache_root: null
+    score_weights:
+      overlap: 1.0
+      confidence: 0.5
+      blur: 0.1
+
+  # Optional pre-render Gaussian selection. With enabled=false, this path is
+  # not entered and the original NoPoSplat tensors are passed through exactly.
+  gaussian_retention:
+    enabled: false
+    apply_during_train: true
+    apply_during_eval: true
+    # opacity | base_opacity | reliability | random | external
+    score_source: opacity
+    external_score_key: retention_score
+    random_seed: 0
+    # fixed_ratio | fixed_count | elastic
+    mode: fixed_ratio
+    keep_ratio: 0.5
+    keep_count: null
+    threshold: 0.5
+    max_gaussians: null
+    start_step: 0
+    log_diagnostics: true
+    diagnostics_every_n_steps: 100
+    local_cells:
+      enabled: false
+      cell_size: 16
+      demand_key: cell_demand
+      demand_source: external
+      detail_strength: 1.0
+      demand_floor: 0.0
+      # 0: pure global competition, 1: reserve the best Gaussian per cell.
+      min_per_cell: 0
+
+#dataset:
+#  overfit_to_scene: null
+
+data_loader:
+  # Avoid having to spin up new processes to print out visualizations.
+  train:
+    num_workers: 16
+    persistent_workers: true
+    batch_size: 4
+    seed: 1234
+  test:
+    num_workers: 4
+    persistent_workers: false
+    batch_size: 1
+    seed: 2345
+  val:
+    num_workers: 1
+    persistent_workers: true
+    batch_size: 1
+    seed: 3456
+
+optimizer:
+  lr: 1.5e-4
+  warm_up_steps: 2000
+  backbone_lr_multiplier: 0.1
+
+checkpointing:
+  load: null
+  every_n_train_steps: 5000
+  save_top_k: 1
+  save_weights_only: true
+
+train:
+  # full: legacy training; heads: freeze Transformer, train all output heads.
+  finetune_scope: full
+  depth_mode: null
+  extended_visualization: false
+  validation_videos: true
+  print_log_every_n_steps: 10
+  distiller: ''
+  distill_max_steps: 1000000
+
+debug:
+  anchor:
+    enabled: false
+    output_dir: debug_anchor
+    save_first_n_batches: 4
+  geo:
+    enabled: false
+    output_dir: debug_geo
+    save_first_n_batches: 4
+
+test:
+  output_path: outputs/test
+  align_pose: true
+  pose_align_steps: 100
+  rot_opt_lr:  0.005
+  trans_opt_lr:  0.005
+  compute_scores: true
+  save_image: true
+  save_video: false
+  save_compare: false
+  save_olp_stats: false
+  olp_tau_alpha: 0.95
+  olp_tau_scale: null
+  olp_tau_volume: null
+  olp_adaptive_tau_scale_quantile: 0.95
+  save_gaussian_cap_stats: false
+  gaussian_cap_ratios: null
+  olp_raw_dump: false
+  olp_raw_dump_max_locations: 256
+  olp_raw_dump_full_maps: false
+
+seed: 111123
+
+trainer:
+  max_steps: -1
+  val_check_interval: 250
+  num_sanity_val_steps: 2
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  limit_test_batches: null
+  num_nodes: 1
+
+hydra:
+  run:
+    dir: outputs/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}

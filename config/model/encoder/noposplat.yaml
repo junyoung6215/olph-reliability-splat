@@ -1,0 +1,49 @@
+defaults:
+  - backbone: croco
+
+name: noposplat
+
+opacity_mapping:
+  initial: 0.0
+  final: 0.0
+  warm_up: 1
+
+num_monocular_samples: 32
+num_surfaces: 1
+predict_opacity: false
+
+gaussians_per_pixel: 1
+
+gaussian_adapter:
+  gaussian_scale_min: 0.5
+  gaussian_scale_max: 15.0
+  sh_degree: 4
+
+d_feature: 128
+
+visualizer:
+  num_samples: 8
+  min_resolution: 256
+  export_ply: false
+
+apply_bounds_shim: true
+
+gs_params_head_type: dpt_gs
+pose_free: true
+pretrained_weights: ""
+
+orthogonal_preconditioner:
+  enabled: false
+  mode: hadamard
+  dim: 256
+  mix: 0.0
+  target_mix: 1.0
+  warmup_steps: 5000
+  seed: 0
+  collect_stats: false
+
+gaussian_reliability:
+  enabled: false
+  r_min: 0.05
+  r_init: 0.95
+  detach_gate: false

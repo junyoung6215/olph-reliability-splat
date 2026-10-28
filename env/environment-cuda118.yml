@@ -1,0 +1,7 @@
+name: noposplat-olp-cuda118
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.13
+  - pip
