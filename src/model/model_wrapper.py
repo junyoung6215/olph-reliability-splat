@@ -65,7 +65,11 @@ from .gaussian_retention import (
     GaussianRetentionCfg,
     GaussianRetentionResult,
     deterministic_random_scores,
+    filtered_random_scores,
     flatten_gaussian_scores,
+    merge_into_kept,
+    retention_budget_loss,
+    retention_budget_weight,
     retention_score_statistics,
     retention_selection_mask,
 )
@@ -272,12 +276,43 @@ class ModelWrapper(LightningModule):
             raise ValueError(f"Unsupported retention stage: {stage!r}.")
         return self.gaussian_retention.applies(stage, int(self.global_step))
 
+    def _retention_budget_active(self) -> bool:
+        cfg = self.gaussian_retention.cfg
+        return bool(cfg.enabled) and bool(cfg.apply_during_train) and float(cfg.budget_weight) > 0
+
+    def _retention_budget_loss(
+        self,
+        gaussians: Gaussians,
+        batch: BatchedExample,
+        visualization_dump: dict | None,
+    ) -> Tensor:
+        reliability = self._retention_scores_from(
+            "reliability", gaussians, batch, visualization_dump, int(self.global_step)
+        )
+        layout = self._retention_grid_layout(gaussians, batch)
+        cell_size = int(self.local_cell_allocator.cfg.cell_size)
+        cell_ids = gaussian_cell_ids(layout, cell_size, reliability.device)
+        cfg = self.gaussian_retention.cfg
+        loss, stats = retention_budget_loss(
+            reliability,
+            cell_ids,
+            layout.cell_count(cell_size),
+            float(cfg.keep_ratio),
+            float(self.encoder.gaussian_reliability_cfg.r_min),
+        )
+        for name, value in stats.items():
+            self.log(f"retention_budget/{name}", value)
+        weight = retention_budget_weight(cfg, int(self.global_step))
+        self.log("retention_budget/weight", weight)
+        return loss * weight
+
     def _retention_requires_visualization_dump(self, stage: str) -> bool:
         if not self._retention_applies(stage):
             return False
         needs_score_dump = self.gaussian_retention.cfg.score_source in (
             "base_opacity",
             "reliability",
+            "reliability_filtered",
             "external",
         )
         return needs_score_dump or bool(self.local_cell_allocator.cfg.enabled)
@@ -311,6 +346,31 @@ class ModelWrapper(LightningModule):
         selection_id: int,
     ) -> Tensor:
         source = self.gaussian_retention.cfg.score_source
+        if source == "opacity":
+            return gaussians.opacities
+
+        if source == "reliability_filtered":
+            return filtered_random_scores(
+                self._retention_scores_from(
+                    "reliability", gaussians, batch, visualization_dump, selection_id
+                ),
+                self._retention_scores_from(
+                    "random", gaussians, batch, visualization_dump, selection_id
+                ),
+                float(self.gaussian_retention.cfg.reliability_floor),
+            )
+        return self._retention_scores_from(
+            source, gaussians, batch, visualization_dump, selection_id
+        )
+
+    def _retention_scores_from(
+        self,
+        source: str,
+        gaussians: Gaussians,
+        batch: BatchedExample,
+        visualization_dump: dict | None,
+        selection_id: int,
+    ) -> Tensor:
         if source == "opacity":
             return gaussians.opacities
 
@@ -413,6 +473,9 @@ class ModelWrapper(LightningModule):
             demand = image_detail_demand(
                 self._denormalize_context_image(batch["context"]["image"]),
                 strength=cfg.detail_strength)
+        elif cfg.demand_source == "uniform":
+            image = batch["context"]["image"]
+            demand = image.new_ones(image.shape[0], image.shape[1], *image.shape[-2:])
         elif cfg.demand_source == "external":
             demand = self._find_retention_tensor(cfg.demand_key, batch, visualization_dump)
         else:
@@ -500,6 +563,18 @@ class ModelWrapper(LightningModule):
             scores,
             required_mask=required_mask,
         )
+        if (
+            allocation is not None
+            and bool(self.local_cell_allocator.cfg.merge)
+            and result.indices is not None
+        ):
+            result = GaussianRetentionResult(
+                gaussians=merge_into_kept(gaussians, result.indices, allocation.cell_ids),
+                indices=result.indices,
+                input_count=result.input_count,
+                output_count=result.output_count,
+                applied=result.applied,
+            )
         self._log_retention_statistics(
             stage,
             scores,
@@ -841,6 +916,7 @@ class ModelWrapper(LightningModule):
             or self._reliability_loss_active()
             or self._prior_loss_active()
             or self._retention_requires_visualization_dump("train")
+            or self._retention_budget_active()
         ):
             visualization_dump = {}
         gaussians = self.encoder(
@@ -913,6 +989,11 @@ class ModelWrapper(LightningModule):
                                                     pseudo_gt1['conf'], pseudo_gt2['conf'], disable_view1=False) * 0.1
             self.log("loss/distillation_loss", distillation_loss)
             total_loss = total_loss + distillation_loss
+
+        if self._retention_budget_active():
+            budget_loss = self._retention_budget_loss(gaussians, batch, visualization_dump)
+            self.log("loss/retention_budget", budget_loss)
+            total_loss = total_loss + budget_loss
 
         self.log("loss/total", total_loss)
 
@@ -1101,7 +1182,7 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.align_pose:
             output = self.test_step_align(batch, gaussians)
         else:
-            with self.benchmarker.time("decoder", num_calls=v):
+            with self.benchmarker.memory("decoder"), self.benchmarker.time("decoder", num_calls=v):
                 output = self.decoder.forward(
                     gaussians,
                     batch["target"]["extrinsics"],
@@ -1236,15 +1317,16 @@ class ModelWrapper(LightningModule):
 
                         extrinsics = rearrange(new_extrinsic, "(b v) i j -> b v i j", b=b, v=v)
 
-        # Render Gaussians.
-        output = self.decoder.forward(
-            gaussians,
-            extrinsics,
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-        )
+        # Render Gaussians. Timed here too: with align_pose the final render is the decoder cost.
+        with torch.no_grad(), self.benchmarker.memory("decoder"), self.benchmarker.time("decoder", num_calls=v):
+            output = self.decoder.forward(
+                gaussians,
+                extrinsics,
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+            )
 
         return output
 
@@ -1255,6 +1337,7 @@ class ModelWrapper(LightningModule):
         self.benchmarker.dump_memory(
             path / "peak_memory.json"
         )
+        self.benchmarker.dump_stage_memory(path / "stage_memory.json")
         if self.test_cfg.save_olp_stats:
             self.olp_eval_recorder.write(path)
         self._write_gaussian_cap_metrics(path)

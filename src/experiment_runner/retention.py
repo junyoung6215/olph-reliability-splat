@@ -23,7 +23,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "config/experiment_runs/retention_suite.yaml"
-SCORES = ("random", "base_opacity", "opacity", "reliability")
+SCORES = ("random", "base_opacity", "opacity", "reliability", "reliability_filtered")
+FULL_TEST_INDEX = "assets/evaluation_index_re10k.json"
 
 
 def read_settings(path):
@@ -84,8 +85,11 @@ def build_plan(cfg, args):
         raise ValueError("run-id must be a short alphanumeric/underscore/hyphen name")
     output = local_path(cfg["output_root"]) / run_id
     checkpoint = local_path(args.checkpoint or cfg["initial_checkpoint"])
-    index_key = "validation_index" if train or args.split == "validation" else "evaluation_index"
-    index = local_path(cfg[index_key])
+    if not train and args.split == "full":
+        # Official RE10K test index, as reported by NoPoSplat and others.
+        index = local_path(FULL_TEST_INDEX)
+    else:
+        index = local_path(cfg["validation_index" if train or args.split == "validation" else "evaluation_index"])
     t = cfg["train"]
     for name, value in (("olp_enabled", cfg["olp_enabled"]),
                         ("reliability_enabled", cfg["reliability_enabled"]),
@@ -99,11 +103,18 @@ def build_plan(cfg, args):
                         ("detail_strength", cfg["local"]["detail_strength"])):
         if not isinstance(value, (float, int)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
+    if not isinstance(cfg["reliability_floor"], (float, int)) or not 0 <= cfg["reliability_floor"] <= 1:
+        raise ValueError("reliability_floor must be in [0, 1]")
     if not 0 <= cfg["olp_mix"] <= 1 or not 0 <= cfg["reliability_r_min"] < 1:
         raise ValueError("Invalid OLP mix or reliability r_min")
     positive_int(cfg["local"]["cell_size"], "local.cell_size")
     if cfg["local"]["min_per_cell"] not in (0, 1):
         raise ValueError("local.min_per_cell must be 0 or 1")
+    if cfg["local"]["demand_source"] not in ("image_detail", "uniform"):
+        raise ValueError("local.demand_source must be image_detail or uniform")
+    for key in ("stratified", "merge"):
+        if type(cfg["local"][key]) is not bool:
+            raise ValueError(f"local.{key} must be a YAML boolean")
     for key in ("steps", "batch_size", "accumulate", "validation_interval", "checkpoint_interval"):
         positive_int(t[key], f"train.{key}")
     if type(t["workers"]) is not int or t["workers"] < 0:
@@ -135,9 +146,12 @@ def build_plan(cfg, args):
         "test.save_olp_stats": False, "test.save_gaussian_cap_stats": False,
         "model.gaussian_retention.mode": "fixed_ratio",
         "model.gaussian_retention.random_seed": cfg["seed"],
+        "model.gaussian_retention.reliability_floor": cfg["reliability_floor"],
         "model.gaussian_retention.start_step": 0,
         "model.gaussian_retention.diagnostics_every_n_steps": 1,
-        "model.gaussian_retention.local_cells.demand_source": "image_detail",
+        "model.gaussian_retention.local_cells.demand_source": cfg["local"]["demand_source"],
+        "model.gaussian_retention.local_cells.stratified": cfg["local"]["stratified"],
+        "model.gaussian_retention.local_cells.merge": cfg["local"]["merge"],
         "model.gaussian_retention.local_cells.cell_size": cfg["local"]["cell_size"],
         "model.gaussian_retention.local_cells.detail_strength": cfg["local"]["detail_strength"],
         "model.gaussian_retention.local_cells.min_per_cell": cfg["local"]["min_per_cell"],
@@ -166,6 +180,17 @@ def build_plan(cfg, args):
             raise ValueError("--local requires --prune; otherwise allocation has no effect")
         if arm != "control" and not cfg["reliability_enabled"]:
             raise ValueError("Auxiliary reliability losses require the reliability head")
+        if not math.isfinite(args.budget_weight) or args.budget_weight < 0:
+            raise ValueError("--budget-weight must be finite and nonnegative")
+        if type(args.soft_steps) is not int or args.soft_steps < 0:
+            raise ValueError("--soft-steps must be a nonnegative integer")
+        if not math.isfinite(args.budget_hard_scale) or args.budget_hard_scale < 0:
+            raise ValueError("--budget-hard-scale must be finite and nonnegative")
+        if args.budget_warmup and args.soft_steps == 0:
+            raise ValueError("--budget-warmup ramps over --soft-steps, which must be positive")
+        if (args.budget_weight > 0 or args.soft_steps > 0) and not (
+                args.local and args.score == "reliability"):
+            raise ValueError("--budget-weight/--soft-steps need --prune --local --score reliability")
         base.update({
             "trainer.max_steps": args.steps if args.steps is not None else t["steps"],
             "trainer.accumulate_grad_batches": accumulate,
@@ -179,6 +204,10 @@ def build_plan(cfg, args):
             "optimizer.lr": t["lr"],
             "optimizer.backbone_lr_multiplier": t["backbone_lr_multiplier"],
             "model.gaussian_retention.diagnostics_every_n_steps": 100,
+            "model.gaussian_retention.budget_weight": args.budget_weight,
+            "model.gaussian_retention.start_step": args.soft_steps,
+            "model.gaussian_retention.budget_warmup": args.budget_warmup,
+            "model.gaussian_retention.budget_hard_scale": args.budget_hard_scale,
         })
         positive_int(base["trainer.max_steps"], "steps")
         if arm in ("legacy", "prior"):
@@ -197,23 +226,26 @@ def build_plan(cfg, args):
         variants = [(arm + ("-pruned" if args.prune else "-full"), args.score,
                      ratio_value(args.ratio) if args.prune else 1.0, args.local, args.prune)]
     else:
-        scores = args.scores or cfg["evaluation"]["scores"]
+        scores = cfg["evaluation"]["scores"] if args.scores is None else args.scores
         ratios = [ratio_value(r) for r in (args.ratios or cfg["evaluation"]["ratios"])]
-        if not scores or set(scores) - set(SCORES) or len(set(scores)) != len(scores):
+        if set(scores) - set(SCORES) or len(set(scores)) != len(scores):
             raise ValueError("scores must be distinct supported scores")
+        if not scores and args.baselines == "none":
+            raise ValueError("eval-grid needs at least one baseline or score")
         if len(set(ratios)) != len(ratios):
             raise ValueError("ratios must be distinct")
         # Both baselines are intentional: OFF vs identity is a deployment gate,
         # not two independent scientific baselines.
         variants = [("baseline-off", "opacity", 1.0, False, False),
                     ("baseline-identity", "opacity", 1.0, False, True)]
+        variants = {"both": variants, "off": variants[:1], "none": []}[args.baselines]
         for score in scores:
             for ratio in ratios:
                 for local in ([False, True] if args.local == "both" else [args.local == "on"]):
                     variants.append((f"{score}-r{ratio:g}-local{int(local)}", score, ratio, local, True))
     jobs = []
     for name, score, ratio, local, enabled in variants:
-        if enabled and score == "reliability" and not cfg["reliability_enabled"]:
+        if enabled and score.startswith("reliability") and not cfg["reliability_enabled"]:
             raise ValueError("Reliability ranking requires reliability_enabled=true")
         directory = output / name
         settings = dict(base, **{
@@ -279,7 +311,8 @@ def preflight(plan):
     held_out = read_index(local_path(cfg["evaluation_index"]))
     validation_scenes = {s for s, row in validation.items() if row is not None}
     test_scenes = {s for s, row in held_out.items() if row is not None}
-    if validation_scenes & test_scenes:
+    # val64 and Test 500 were split from the official index, so it overlaps them by design.
+    if plan["split"] != "full" and validation_scenes & test_scenes:
         raise ValueError("Validation and held-out test scene IDs overlap")
     if plan["command"] == "train" and plan["training"]["sampler"] == "fixed":
         from src.foundation.pairs import load_training_pairs
@@ -401,9 +434,20 @@ def parser():
             p.add_argument("--ratio", type=float, default=.5)
             p.add_argument("--score", choices=SCORES, default="reliability")
             p.add_argument("--local", action="store_true")
+            p.add_argument("--budget-weight", type=float, default=0.0,
+                           help="Push reliability of Gaussians outside the budget toward r_min")
+            p.add_argument("--soft-steps", type=int, default=0,
+                           help="Render all Gaussians for this many steps before hard pruning")
+            p.add_argument("--budget-warmup", action="store_true",
+                           help="Ramp the budget weight from 0 over the soft steps")
+            p.add_argument("--budget-hard-scale", type=float, default=1.0,
+                           help="Budget weight multiplier once hard pruning starts")
         else:
-            p.add_argument("--split", choices=("validation", "test"), default="validation")
-            p.add_argument("--scores", nargs="+", choices=SCORES)
+            p.add_argument("--split", choices=("validation", "test", "full"), default="validation",
+                           help="full = official RE10K test index (comparable to published results)")
+            p.add_argument("--scores", nargs="*", choices=SCORES)
+            p.add_argument("--baselines", choices=("both", "off", "none"), default="both",
+                           help="Full-count baselines to run before the score variants")
             p.add_argument("--ratios", nargs="+", type=float)
             p.add_argument("--local", choices=("off", "on", "both"), default="off")
     p = sub.add_parser("summarize")

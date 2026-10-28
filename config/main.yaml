@@ -31,10 +31,18 @@ model:
     enabled: false
     apply_during_train: true
     apply_during_eval: true
-    # opacity | base_opacity | reliability | random | external
+    # opacity | base_opacity | reliability | random | reliability_filtered | external
     score_source: opacity
     external_score_key: retention_score
     random_seed: 0
+    # reliability_filtered: drop Gaussians below this reliability first, rest at random.
+    reliability_floor: 0.5
+    # >0: during training, push reliability outside the budget toward r_min, inside toward 1.
+    budget_weight: 0.0
+    # true: ramp budget_weight from 0 over the soft phase (before start_step).
+    budget_warmup: false
+    # Budget weight multiplier once hard pruning starts.
+    budget_hard_scale: 1.0
     # fixed_ratio | fixed_count | elastic
     mode: fixed_ratio
     keep_ratio: 0.5
@@ -53,6 +61,10 @@ model:
       demand_floor: 0.0
       # 0: pure global competition, 1: reserve the best Gaussian per cell.
       min_per_cell: 0
+      # true: keep keep_ratio of every cell (score ranks only inside a cell).
+      stratified: false
+      # true: fold dropped Gaussians into the nearest kept one of their cell.
+      merge: false
 
 #dataset:
 #  overfit_to_scene: null

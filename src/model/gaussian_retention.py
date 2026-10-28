@@ -5,9 +5,10 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .local_cell_retention import LocalCellRetentionCfg
+from .local_cell_retention import LocalCellRetentionCfg, stratified_cell_scores
 from .types import Gaussians
 
 
@@ -17,6 +18,7 @@ RetentionScoreSource = Literal[
     "base_opacity",
     "reliability",
     "random",
+    "reliability_filtered",
     "external",
 ]
 
@@ -37,6 +39,20 @@ class GaussianRetentionCfg:
     score_source: RetentionScoreSource = "opacity"
     external_score_key: str = "retention_score"
     random_seed: int = 0
+    # reliability_filtered: Gaussians with reliability below this floor are
+    # dropped first; the rest of the budget is chosen at random.
+    reliability_floor: float = 0.5
+    # Budget loss on reliability during training: Gaussians that the current
+    # ranking (stratified by local_cells.cell_size) would drop are pushed toward
+    # r_min and the kept ones toward 1. Before start_step all Gaussians are still rendered, so the
+    # reconstruction loss decides which ones can fade and r learns a ranking
+    # for pruning. 0 disables it.
+    budget_weight: float = 0.0
+    # Ramp the budget weight linearly from 0 over the soft phase (start_step)
+    # instead of applying it in full from the first step.
+    budget_warmup: bool = False
+    # Budget weight multiplier once hard pruning starts (after start_step).
+    budget_hard_scale: float = 1.0
     mode: RetentionMode = "fixed_ratio"
     keep_ratio: float = 0.5
     keep_count: int | None = None
@@ -164,6 +180,59 @@ def deterministic_random_scores(
     return scores.to(dtype=reference.dtype)
 
 
+def filtered_random_scores(reliability: Tensor, random: Tensor, floor: float) -> Tensor:
+    """Rank Gaussians below the reliability floor last, and the rest at random.
+
+    Random scores lie in [0, 1), so the +1 offset keeps every Gaussian at or
+    above the floor ahead of every Gaussian below it.
+    """
+
+    return random + (reliability >= floor).to(random.dtype)
+
+
+def retention_budget_weight(cfg: GaussianRetentionCfg, step: int) -> float:
+    """Budget loss weight at a training step: optional ramp, then hard scale."""
+
+    weight = float(cfg.budget_weight)
+    soft = int(cfg.start_step)
+    if step >= soft:
+        return weight * float(cfg.budget_hard_scale)
+    if cfg.budget_warmup:
+        return weight * step / soft
+    return weight
+
+
+def retention_budget_loss(
+    reliability: Tensor,
+    cell_ids: Tensor,
+    cells: int,
+    keep_ratio: float,
+    r_min: float,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Pull the Gaussians each cell would drop to r_min and the kept ones to 1.
+
+    The split follows the stratified top-k of the detached reliability. Both
+    sides are needed: reliability multiplies opacity, so a one-sided push lets
+    every gate shrink together while base opacity compensates, and the gap
+    between kept and dropped never opens. Also returns detached kept/dropped
+    reliability means for monitoring.
+    """
+
+    batch, count = reliability.shape
+    keys = stratified_cell_scores(reliability.detach(), cell_ids, cells)
+    kept = max(1, min(count, int(round(count * float(keep_ratio)))))
+    indices = torch.topk(keys, kept, dim=1).indices
+    dropped = ~retention_selection_mask(reliability, indices)
+    detached = reliability.detach()
+    stats = {"kept_mean": detached.masked_select(~dropped).mean()}
+    if not bool(dropped.any()):
+        return (1.0 - reliability).mean(), stats
+    stats["dropped_mean"] = detached.masked_select(dropped).mean()
+    loss = (reliability - float(r_min)).masked_select(dropped).mean()
+    loss = loss + (1.0 - reliability).masked_select(~dropped).mean()
+    return loss, stats
+
+
 def gather_gaussians(gaussians: Gaussians, indices: Tensor) -> Gaussians:
     """Gather every Gaussian field with the same per-batch indices."""
 
@@ -193,6 +262,75 @@ def gather_gaussians(gaussians: Gaussians, indices: Tensor) -> Gaussians:
         covariances=gather(gaussians.covariances),
         harmonics=gather(gaussians.harmonics),
         opacities=gather(gaussians.opacities),
+    )
+
+
+def merge_into_kept(
+    gaussians: Gaussians,
+    indices: Tensor,
+    cell_ids: Tensor,
+) -> Gaussians:
+    """Fold every dropped Gaussian into the nearest kept Gaussian of its cell.
+
+    Kept Gaussians become opacity-weighted moment matches of their group, so
+    pruning removes primitives without leaving uncovered gaps. Cells must have
+    equal size. Returns the merged Gaussians at ``indices``.
+    """
+
+    batch, count = _validate_gaussians(gaussians)
+    sizes = torch.bincount(cell_ids)
+    size = int(sizes[0].item())
+    if bool((sizes != size).any()):
+        raise ValueError("Gaussian merging requires equally sized cells.")
+    cells = count // size
+    order = torch.argsort(cell_ids, stable=True)
+
+    def grouped(field: Tensor) -> Tensor:
+        return field.index_select(1, order).reshape(
+            batch, cells, size, *field.shape[2:]
+        )
+
+    kept = grouped(retention_selection_mask(gaussians.opacities, indices))
+    means = grouped(gaussians.means)
+    covariances = grouped(gaussians.covariances)
+    harmonics = grouped(gaussians.harmonics)
+    opacities = grouped(gaussians.opacities)
+
+    # assign[b, c, i, j]: member i is absorbed by kept member j (kept -> itself).
+    distance = (means[..., :, None, :] - means[..., None, :, :]).square().sum(-1)
+    distance = distance.detach().masked_fill(~kept[..., None, :], torch.inf)
+    nearest = distance.argmin(-1)
+    has_target = torch.isfinite(distance.amin(-1))
+    assign = F.one_hot(nearest, size).to(opacities.dtype)
+    assign = assign * has_target[..., None].to(opacities.dtype)
+
+    weights = assign * (opacities[..., :, None] + 1e-6)
+    total = weights.sum(-2).clamp_min(1e-12)
+    merged_means = torch.einsum("bcij,bcix->bcjx", weights, means) / total[..., None]
+    offset = means[..., :, None, :] - merged_means[..., None, :, :]
+    spread = covariances[..., :, None, :, :] + offset[..., :, None] * offset[..., None, :]
+    merged_covariances = (
+        torch.einsum("bcij,bcijxy->bcjxy", weights, spread) / total[..., None, None]
+    )
+    merged_harmonics = (
+        torch.einsum("bcij,bcixd->bcjxd", weights, harmonics) / total[..., None, None]
+    )
+    transmittance = torch.log1p(-opacities.clamp(max=1.0 - 1e-6))
+    merged_opacities = 1.0 - torch.exp(torch.einsum("bcij,bci->bcj", assign, transmittance))
+
+    inverse = torch.argsort(order)
+
+    def flat(field: Tensor) -> Tensor:
+        return field.reshape(batch, count, *field.shape[3:]).index_select(1, inverse)
+
+    return gather_gaussians(
+        Gaussians(
+            means=flat(merged_means),
+            covariances=flat(merged_covariances),
+            harmonics=flat(merged_harmonics),
+            opacities=flat(merged_opacities),
+        ),
+        indices,
     )
 
 
@@ -251,6 +389,7 @@ class GaussianRetention(nn.Module):
             "base_opacity",
             "reliability",
             "random",
+            "reliability_filtered",
             "external",
         ):
             raise ValueError(
@@ -277,6 +416,10 @@ class GaussianRetention(nn.Module):
             raise ValueError(
                 "gaussian_retention.diagnostics_every_n_steps must be positive."
             )
+        if not math.isfinite(float(self.cfg.budget_weight)) or self.cfg.budget_weight < 0:
+            raise ValueError("gaussian_retention.budget_weight must be finite and nonnegative.")
+        if not math.isfinite(float(self.cfg.budget_hard_scale)) or self.cfg.budget_hard_scale < 0:
+            raise ValueError("gaussian_retention.budget_hard_scale must be finite and nonnegative.")
         if not self.cfg.external_score_key:
             raise ValueError("gaussian_retention.external_score_key must not be empty.")
 

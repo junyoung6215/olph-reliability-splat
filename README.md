@@ -1,279 +1,290 @@
 <div align="center">
 
-# OLP-H + Gaussian Reliability
+<h1>Stratified Retention for Compact<br>Pose-free Feed-forward 3D Gaussian Splatting</h1>
 
-### Floater-aware, budget-robust Gaussians for pose-free feed-forward 3D Gaussian Splatting
+**Kyoosuk Hwang** · **Junyoung Kwon**
 
-[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](#getting-started)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.1.2-EE4C2C?logo=pytorch&logoColor=white)](#getting-started)
-[![CUDA](https://img.shields.io/badge/CUDA-11.8-76B900?logo=nvidia&logoColor=white)](#getting-started)
-[![Base](https://img.shields.io/badge/built%20on-NoPoSplat-6E56CF)](https://github.com/cvg/NoPoSplat)
+Seoul National University of Science and Technology (SeoulTech) · Capstone Design 2026
+
+[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](#installation)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.1.2-EE4C2C?logo=pytorch&logoColor=white)](#installation)
+[![CUDA](https://img.shields.io/badge/CUDA-11.8-76B900?logo=nvidia&logoColor=white)](#installation)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 **English** · [한국어](README_KO.md)
 
-Capstone Design project · SeoulTech · 2026<br>
-Junyoung Kwon · Kyoosuk Hwang
-
 </div>
 
----
-
 <p align="center">
-  <img src="docs/figures/teaser.jpg" alt="Novel views on RealEstate10K: context view, ground truth, NoPoSplat, OLP-H, and OLP-H with the reliability head, with per-image PSNR" width="100%">
-  <br>
-  <sub>Novel views from two unposed RealEstate10K images. Per-image PSNR below each render; the best of the three models is highlighted.</sub>
+  <img src="docs/figures/hero_qualitative.jpg" alt="Novel views on RealEstate10K: ground truth, the unpruned base model with 131K Gaussians, and our model with 75%, 50% and 25% of the Gaussians" width="100%">
 </p>
+<p align="center"><sub>
+Novel views from <b>two unposed images</b> (RealEstate10K). Keeping 75 / 50 / 25% of the per-pixel Gaussians, our model stays
+close to the unpruned base. Per-image PSNR in the corner.
+</sub></p>
 
-Feed-forward 3DGS models such as [NoPoSplat](https://github.com/cvg/NoPoSplat) reconstruct a scene from
-two **unposed** images in a single forward pass. They predict one Gaussian per pixel, so every Gaussian is
-rendered with the same trust — including the floaters and low-confidence primitives that hurt novel views.
+## News
 
-This project adds two lightweight modules on top of NoPoSplat's Gaussian head:
+- **2026-10-30** — Final presentation (Capstone Design 2). Code for stratified retention and pruning-aware fine-tuning released.
+- **2026-06-12** — OLP-H and the Gaussian reliability head (Capstone Design 1).
 
-- **OLP-H (Orthogonal Latent Preconditioner, Hadamard)** — a fixed randomized Hadamard rotation of the
-  head feature that reshapes the predicted Gaussian distribution toward fewer high-opacity primitives.
-- **Gaussian Reliability Head** — a per-Gaussian gate `r ∈ [r_min, 1]` that softly scales opacity, trained
-  with a weak *context-residual* signal so unreliable Gaussians fade out instead of being hard-pruned.
+## Abstract
 
-## Highlights
-
-| | |
-| --- | --- |
-| 🎯 **3.6× lower floater proxy** | OLP-H reduces the high-opacity × large-scale Gaussian ratio from 2.95e-4 to 8.16e-5 (300 matched scenes). |
-| 📉 **Fewer active Gaussians** | Active ratio at opacity > 0.3 drops from 0.621 to 0.534 at the same generated count. |
-| 🪶 **Budget-robust** | Keeping only the top-75% Gaussians costs NoPoSplat −6.9 dB PSNR but OLP-H only −4.5 dB. |
-| 🔁 **Reliability recovers quality** | The reliability head lifts OLP-H by **+1.04 dB PSNR** and lowers LPIPS 0.181 → 0.163 on the full RE10K test set. |
+Feed-forward 3D Gaussian Splatting from unposed images predicts one Gaussian per pixel, so two 256×256 views already
+produce 131K Gaussians, many of them redundant. We study how to keep only a fraction of them in a single forward pass
+without losing quality. On top of a pretrained pose-free model we add **OLP-H**, a fixed randomized Hadamard rotation of
+the Gaussian-head feature, and a **reliability head** that predicts a per-Gaussian score *r* and softly scales opacity.
+We then show that the natural next step, keeping the global top-k Gaussians by *r*, fails: low-*r* Gaussians cluster in
+space, so whole regions vanish (14.49 dB vs. 19.05 dB for random selection at 50%). **Stratified retention** keeps the
+same fraction in every 2×2 cell after filtering out Gaussians with *r* < 0.35, so no region is left empty, and
+**pruning-aware fine-tuning** lets the remaining Gaussians grow into the gaps. With half of the Gaussians our model reaches
+25.24 dB on RealEstate10K (Test 500), 0.15 dB above the unpruned base, while peak render memory drops by 48%. We also find
+that *r* measures reliability rather than redundancy, and is better used as a filter than as a pruning ranking.
 
 ## Method
 
 <p align="center">
-  <img src="docs/figures/pipeline.svg" alt="Pipeline: NoPoSplat backbone, OLP-H preconditioner, Gaussian and reliability heads, opacity gating, and the training-only context residual loss" width="100%">
+  <img src="docs/figures/architecture.png" alt="Architecture: pose-free backbone, OLP-H, Gaussian heads with reliability, pixel-aligned Gaussians, stratified retention, splatting, and pruning-aware fine-tuning" width="100%">
 </p>
 
-**OLP-H.** Before the Gaussian parameter head, each 256-channel DPT feature vector `x` is rotated by a fixed
-orthogonal matrix
+| | Component | What it does | Code |
+| :-: | --- | --- | --- |
+| ① | **OLP-H** | Rotates each 256-ch head feature by a fixed orthogonal `Q = H·D·P / √C` (Walsh–Hadamard, random signs, channel permutation); no learnable parameters. | [`latent_preconditioner.py`](src/model/encoder/heads/latent_preconditioner.py) |
+| ② | **Reliability head** | Predicts `r = r_min + (1 − r_min)·σ(a)` per Gaussian and renders with opacity `α·r`; trained with a context-residual loss. | [`dpt_gs_head.py`](src/model/encoder/heads/dpt_gs_head.py), [`loss_reliability.py`](src/loss/loss_reliability.py) |
+| ③ | **Stratified retention** | Splits the pixel grid into *k*×*k* cells and keeps the same fraction ρ in every cell: Gaussians with `r < 0.35` are dropped first, the rest is filled at random. | [`gaussian_retention.py`](src/model/gaussian_retention.py), [`local_cell_retention.py`](src/model/local_cell_retention.py) |
+| ④ | **Pruning-aware fine-tuning** | Applies the same selection during training; gradients flow through the kept Gaussians only, and all weights are updated for 10K steps. | [`model_wrapper.py`](src/model/model_wrapper.py) |
 
-```text
-Q x = H · D · P · x / √C        (C = 256)
-```
-
-where `P` is a seeded channel permutation, `D` a random ±1 diagonal, and `H` the Walsh–Hadamard transform.
-`Q` is norm-preserving and has no learnable parameters; during fine-tuning it is blended in from identity
-(`mix: 0 → 1` over a warm-up) so the pretrained head can adapt.
-→ [`src/model/encoder/heads/latent_preconditioner.py`](src/model/encoder/heads/latent_preconditioner.py)
-
-**Gaussian Reliability Head.** A two-layer conv branch (3×3 → ReLU → 1×1) on the same preconditioned feature
-predicts a logit `a_g` per Gaussian:
-
-```text
-r_g      = r_min + (1 − r_min) · σ(a_g)        r_min = 0.05, initialised so r_g ≈ 0.95
-α′_g     = α_g · r_g
-```
-
-Nothing is deleted — the gate only changes each Gaussian's rendering contribution, so the model stays
-fully feed-forward. → [`src/model/encoder/heads/dpt_gs_head.py`](src/model/encoder/heads/dpt_gs_head.py)
-
-**Context-residual reliability loss.** During training, the predicted Gaussians are also rendered at the
-*input* cameras. The per-pixel residual `|Î_ctx − I_ctx|` is sampled at each projected Gaussian center as a
-weak risk signal, and
-
-```text
-L_rel = mean_g [ r_g · sg(α_g) · sg(risk_g) ]          λ = 1e-4, linear warm-up 3k → 8k steps
-```
-
-Stop-gradients keep the original opacity / scale / color predictions intact, so the gradient flows only
-into the reliability gate. → [`src/loss/loss_reliability.py`](src/loss/loss_reliability.py)
+Retention happens **before** rasterization, so the renderer only sees ρ·131K Gaussians. Everything is off by default;
+with the default config the code reproduces the pretrained base model.
 
 ## Results
 
-All experiments use RealEstate10K at 256×256 with two context views.
+All numbers use RealEstate10K at 256×256 with two context views. *Base* is the model after ① + ② with all Gaussians;
+*Control* is the same base fine-tuned for the same number of steps without pruning.
 
-### Full RE10K evaluation — 5,601 test pairs, pose-aligned
-
-| Model | Training | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
-| --- | --- | ---: | ---: | ---: |
-| NoPoSplat (official checkpoint) | — | **25.06** | **0.839** | **0.161** |
-| OLP-H | 300k-step fine-tune from NoPoSplat | 23.80 | 0.794 | 0.181 |
-| **OLP-H + Reliability** | +75k steps with `L_rel` | 24.84 | 0.824 | 0.163 |
-| NoPoSplat + transferred reliability head | no fine-tuning | 24.76 | 0.837 | 0.164 |
-
-The reliability head recovers most of the quality lost by OLP-H (+1.04 dB, LPIPS within 0.002 of NoPoSplat)
-while keeping the OLP-H Gaussian distribution.
-Raw metrics and run configs: [`results/reliability_residual/`](results/reliability_residual/README.md)
-
-### Gaussian compactness — 300 matched scenes
+### Main results — RealEstate10K Test 500
 
 <p align="center">
-  <img src="experiment_records/home_data_olp_h_300_20260611/extra/home/data/olp_h_re10k_slot0/noposplat_eval/re10k/olp_h_300_20260611/labmeeting_report_assets/01_active_gaussian_compactness.png" alt="Active Gaussian ratios and floater proxy, NoPoSplat vs OLP-H" width="85%">
+  <img src="docs/figures/quality_vs_gaussians.png" alt="PSNR and LPIPS against the number of rendered Gaussians" width="100%">
 </p>
 
-| Metric (mean over scenes) | NoPoSplat | OLP-H |
-| --- | ---: | ---: |
-| Opacity mean | 0.391 | **0.347** |
-| Active ratio @ α > 0.10 | 0.897 | **0.842** |
-| Active ratio @ α > 0.30 | 0.621 | **0.534** |
-| Active ratio @ α > 0.50 | 0.328 | **0.269** |
-| Floater proxy (high α ∧ large scale) | 2.95e-4 | **8.16e-5** |
+| Model | Kept | #Gaussians | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+| --- | :-: | :-: | :-: | :-: | :-: |
+| Base | 100% | 131K | 25.09 | 0.824 | 0.160 |
+| Control (FT 10K, no pruning) | 100% | 131K | *25.71* | *0.843* | *0.151* |
+| **Ours** | 75% | 98K | **25.49** | **0.837** | **0.157** |
+| **Ours** | 50% | 66K | 25.24 | 0.830 | 0.166 |
+| **Ours** | 25% | 33K | 24.84 | 0.817 | 0.182 |
 
-### Robustness under a Gaussian budget
+At 50% kept, peak render memory drops from **167 MB to 87 MB (−48%)**. Control is shown in italics: with the same
+fine-tuning budget and no pruning it remains 0.47 dB above our 50% model.
 
-Render-time top-K pruning by opacity (no retraining, no pose alignment, same 300 scenes).
+### Full RealEstate10K test set — 5,601 scenes
+
+| Model | #Gaussians | PSNR ↑ | SSIM ↑ | LPIPS ↓ |
+| --- | :-: | :-: | :-: | :-: |
+| Pretrained pose-free base | 131K | 25.06 | 0.839 | 0.161 |
+| + OLP-H (300K-step fine-tune) | 131K | 23.80 | 0.794 | 0.181 |
+| + Reliability head (+75K steps) | 131K | 24.84 | 0.824 | 0.163 |
+| **+ Stratified retention + FT (ours, 50%)** | **66K** | 25.01 | 0.829 | 0.169 |
+| Control: FT 10K, no pruning | 131K | 25.45 | 0.842 | 0.155 |
+
+Rows from the first stage were trained with different schedules; read them as a cumulative path.
+
+### Ablation — why stratified retention and fine-tuning
 
 <p align="center">
-  <img src="experiment_records/home_data_olp_h_300_20260611/extra/home/data/olp_h_re10k_slot0/noposplat_eval/re10k/olp_h_300_20260611/labmeeting_report_assets/02_gaussian_cap_curve_psnr_lpips.png" alt="PSNR and LPIPS as the retained Gaussian budget shrinks" width="85%">
+  <img src="docs/figures/retention_progression.jpg" alt="One scene at 50% of the Gaussians: full, global top-k by r, stratified, and stratified with pruning-aware fine-tuning" width="100%">
 </p>
-
-| Gaussians kept | 100% | 75% | 50% | 25% | 10% |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| NoPoSplat ΔPSNR | 0.00 | −6.90 | −12.22 | −15.79 | −17.46 |
-| OLP-H ΔPSNR | 0.00 | **−4.52** | **−10.53** | **−14.45** | **−16.23** |
-
-### Qualitative — where the errors go
-
-Per-pixel error maps (brighter = larger error). OLP-H alone adds error along roof edges and furniture
-boundaries; in these scenes the reliability head removes much of it.
 
 <p align="center">
-  <img src="docs/figures/error_maps.jpg" alt="Ground truth and per-pixel error maps for NoPoSplat, OLP-H and OLP-H with reliability" width="100%">
+  <img src="docs/figures/ablation_path.png" alt="PSNR at 50% kept as each component is added" width="100%">
 </p>
+
+| Setting (50% kept, validation 64 scenes) | PSNR ↑ | Δ | LPIPS ↓ |
+| --- | :-: | :-: | :-: |
+| Base, 100% (no pruning) | 25.55 | – | 0.157 |
+| Global top-k by *r*, no FT | 14.49 | −11.06 | 0.389 |
+| + Stratified 2×2 | 19.42 | +4.93 | 0.353 |
+| + Pruning-aware FT 2K | 25.49 | +6.07 | 0.165 |
+| + *r* filter (*r* < 0.35) + random fill | 25.62 | +0.13 | 0.161 |
+| + FT 10K (**final**) | **25.80** | +0.18 | **0.158** |
+
+Without fine-tuning, applying the same selection to the control model gives only 19.56 dB, so pruning-aware
+fine-tuning is required.
+
+### Is *r* a good pruning score?
+
+<p align="center">
+  <img src="docs/figures/cell_size_sweep.png" alt="PSNR of r ranking and random selection for cell sizes 2 to 16" width="100%">
+</p>
+
+Ranking by *r* inside larger cells falls further behind random selection (−0.14 → −0.86 dB after FT, −0.53 → −5.02 dB
+without). Low-*r* Gaussians are spatially clustered, and *r* was trained to suppress floaters, not to predict the cost of
+removing a Gaussian. Training *r* with an explicit budget loss gains 0.12–0.32 dB over random on the same model, but still
+stays 0.3 dB below random selection with fine-tuning (25.51 dB). The final model therefore uses *r* only as a filter.
 
 <details>
-<summary><b>More scenes</b> (context · ground truth · NoPoSplat · OLP-H · OLP-H + Reliability, error maps below)</summary>
-<br>
+<summary><b>Cell-size sweep table</b></summary>
 
-<img src="results/reliability_residual/qualitative_examples/scene_4f7ce11656b1bf7b_frame000008_side_by_side.png" alt="Living room" width="100%">
-<img src="results/reliability_residual/qualitative_examples/scene_02b618a34bc12ff9_frame000015_side_by_side.png" alt="Aerial rooftops" width="100%">
-<img src="results/reliability_residual/qualitative_examples/scene_abf2836f83d04375_frame000074_side_by_side.png" alt="Lake" width="100%">
-<img src="results/reliability_residual/qualitative_examples/scene_f22e31c9b9bd3320_frame000148_side_by_side.png" alt="Dining room, low overlap" width="100%">
-<img src="results/reliability_residual/qualitative_examples/scene_d59ce927e3434d0e_frame000096_side_by_side.png" alt="Covered patio, low overlap" width="100%">
-
-The last two are low-overlap pairs (0.22–0.23) where all three models struggle.
+| Cell | *r* ranking (no FT) | Random (no FT) | *r* ranking (FT 2K) | Random (FT 2K) | *r* filter + random (FT 2K) |
+| :-: | :-: | :-: | :-: | :-: | :-: |
+| 2×2 | 19.42 | 19.95 | 25.49 | 25.63 | 25.62 |
+| 4×4 | 17.88 | 19.50 | 25.15 | 25.51 | 25.49 |
+| 8×8 | 15.69 | 19.20 | 24.59 | 25.45 | – |
+| 16×16 | 14.09 | 19.11 | – | – | – |
 
 </details>
 
-### Analysis — what OLP-H does to the latent
-
-Measuring the head feature at the same insertion point, OLP-H output is far more channel-concentrated
-than NoPoSplat's identity path: in a typical scene a single channel is the strongest one at 74% of pixels
-(vs. 28%), and the OLP score (max channel / RMS) nearly doubles.
-
-<p align="center">
-  <img src="experiment_records/home_data_olp_h_300_20260611/extra/home/data/olp_h_re10k_slot0/noposplat_eval/re10k/olp_h_300_20260611/labmeeting_report_assets/10_channel_baseline_vs_olp_summary.png" alt="Channel concentration statistics, NoPoSplat identity vs OLP-H output" width="80%">
-</p>
-
 <details>
-<summary><b>Channel outlier maps</b> for the scene with the highest OLP score</summary>
+<summary><b>Analysis of the first stage (OLP-H and reliability)</b></summary>
 <br>
-<img src="experiment_records/home_data_olp_h_300_20260611/extra/home/data/olp_h_re10k_slot0/noposplat_eval/re10k/olp_h_300_20260611/labmeeting_report_assets/05_channel_outlier_example_maps.png" alt="OLP score, top-1 channel and top-k energy maps" width="100%">
+
+OLP-H lowers the share of high-opacity Gaussians and a floater proxy (high opacity and large scale), and degrades more
+slowly when Gaussians are removed at render time without retraining.
+
+<img src="docs/figures/gaussian_compactness.png" alt="Active Gaussian ratios and floater proxy" width="100%">
+<img src="docs/figures/budget_curve.png" alt="PSNR drop and LPIPS under render-time top-K by opacity" width="100%">
+
+The OLP-H output is strongly channel-concentrated, although the scene-level correlation with the floater proxy is weak.
+
+<img src="docs/figures/channel_concentration.png" alt="OLP score and channel concentration" width="100%">
+<img src="docs/figures/channel_outlier_maps.png" alt="Channel outlier maps for one scene" width="100%">
+
+Raw metrics: [`results/reliability_residual/`](results/reliability_residual/README.md) ·
+analysis notes: [`experiment_records/`](experiment_records/README.md)
 </details>
 
-### Takeaways and limitations
+## Installation
 
-- OLP-H alone is **not** a quality win on the standard benchmark (−1.25 dB vs. the official NoPoSplat
-  checkpoint); its value is in how the Gaussians are distributed and how gracefully they can be pruned.
-- The floater proxy is a heuristic (opacity and scale tails), not ground-truth floater labels.
-- OLP-H outputs show strong channel concentration (a few channels dominate most pixels), but scene-level
-  correlation with the floater proxy is weak (r ≈ 0); causality is still open
-  ([analysis](experiment_records/home_data_olp_h_300_20260611/extra/home/data/olp_h_re10k_slot0/noposplat_eval/re10k/olp_h_300_20260611/analysis/labmeeting_20260612_olp_h_analysis.md)).
-- NoPoSplat numbers come from the official checkpoint trained with a larger batch; our fine-tunes ran on a
-  single GPU (batch 4, gradient accumulation).
-- Checkpoints are not released yet.
-
-## Repository layout
-
-```text
-src/model/encoder/heads/
-  latent_preconditioner.py   OLP-H module (randomized Hadamard, warm-up mix, latent stats)
-  preconditioner_*.py        FWHT math, config, channel-outlier statistics
-  dpt_gs_head.py             Gaussian head + reliability branch + opacity gating
-  reliability_cfg.py         reliability head config
-src/loss/
-  loss_reliability.py        context-residual reliability loss (L_rel)
-src/model/gaussian_retention.py   render-time Gaussian budget / top-K retention
-src/analysis/                OLP-H statistics recorder used in evaluation
-config/                      Hydra configs (OLP-H and reliability are off by default)
-scripts/                     reproducible train / eval / analysis launchers
-tests/                       unit tests for OLP-H, reliability loss, retention
-results/, experiment_records/   curated metrics, configs, figures from the runs above
-docs/                        protocol, implementation diff vs. upstream, server runbook
-```
-
-Every addition is opt-in: with default configs the code behaves exactly like upstream NoPoSplat.
-A file-by-file diff against upstream is in [`docs/OLP_H_DIFF_REPORT_EN.md`](docs/OLP_H_DIFF_REPORT_EN.md).
-
-## Getting started
+Tested with Python 3.10, PyTorch 2.1.2 and CUDA 11.8.
 
 ```bash
-# 1. Environment (PyTorch 2.1.2 + CUDA 11.8, builds diff-gaussian-rasterization)
+git clone https://github.com/junyoung6215/olph-reliability-splat
+cd olph-reliability-splat
+
+# creates the conda env and builds the Gaussian rasterizer for CUDA 11.8
 bash scripts/create_cuda118_env.sh
 conda activate noposplat-olp-cuda118
-
-# 2. Official NoPoSplat RE10K checkpoint -> pretrained_weights/re10k.ckpt
-bash scripts/download_re10k_checkpoint.sh
-
-# 3. Dataset: see DATASETS.md (RealEstate10K)
 ```
 
-**Fine-tune OLP-H, then the reliability head**
+## Data
+
+We use RealEstate10K in the chunked format described in [DATASETS.md](DATASETS.md). Evaluation indices are in
+[`assets/`](assets/); `evaluation_index_re10k.json` is the full test split.
+
+## Checkpoints
+
+The pretrained pose-free base checkpoint is downloaded with
 
 ```bash
+bash scripts/download_re10k_checkpoint.sh      # -> pretrained_weights/re10k.ckpt
+```
+
+| Model | Description | Download |
+| --- | --- | :-: |
+| OLP-H + Reliability | stage 1 (① + ②) | coming soon |
+| Ours, ρ = 50% | stage 2 (③ + ④) | coming soon |
+
+## Training
+
+Training runs in two stages on a single GPU.
+
+**Stage 1 — OLP-H and reliability head (① + ②)**
+
+```bash
+# OLP-H fine-tuning from the pretrained base
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_re10k_olp_ft.sh
 
-CUDA_VISIBLE_DEVICES=0 \
-BASE_CKPT=/path/to/olp_h_300k.ckpt DATA_ROOT=/path/to/re10k \
+# reliability head with the context-residual loss (75K steps)
+CUDA_VISIBLE_DEVICES=0 BASE_CKPT=/path/to/olph.ckpt DATA_ROOT=/path/to/re10k \
 bash scripts/run_re10k_reliability_residual_ft.sh
 ```
 
-**Evaluate** (full RE10K test split)
+**Stage 2 — stratified retention with pruning-aware fine-tuning (③ + ④)**
 
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-BASE_CKPT=/path/to/olp_h_300k.ckpt REL_CKPT=/path/to/olp_h_reliability_75k.ckpt \
-DATA_ROOT=/path/to/re10k \
-bash scripts/run_re10k_reliability_residual_eval.sh
+Copy [`config/experiment_runs/retention_suite.yaml`](config/experiment_runs/retention_suite.yaml), fill in the paths and
+set the final retention settings:
+
+```yaml
+initial_checkpoint: /path/to/olph_reliability.ckpt   # stage-1 output
+reliability_floor: 0.35                              # r filter
+local:
+  cell_size: 2                                       # 2x2 cells
+  stratified: true
+  demand_source: uniform
 ```
 
-**Unit tests** (no dataset needed)
-
 ```bash
-python tests/test_olp_preconditioner.py
-python tests/test_reliability_loss.py
+# prints the planned command; add --execute to launch
+python scripts/run_retention.py --config my_retention.yaml train \
+    --arm control --prune --local --score reliability_filtered --ratio 0.5 --steps 10000 \
+    --run-id ours_r50 --execute
 ```
 
-Upstream installation, dataset and checkpoint details: [`docs/NOPOSPLAT_UPSTREAM_README.md`](docs/NOPOSPLAT_UPSTREAM_README.md).
+`--ratio` is the kept fraction ρ. `--train-scope heads` freezes the backbone for shorter pilots.
 
-## Further reading
+## Evaluation
 
-| Document | Content |
-| --- | --- |
-| [README_OLP_H_EN.md](README_OLP_H_EN.md) | OLP-H settings and run recipes |
-| [README_GAUSSIAN_RELIABILITY_KO.md](README_GAUSSIAN_RELIABILITY_KO.md) | Reliability head design notes and loss roadmap (Korean) |
-| [docs/OLP_H_EXPERIMENT_PROTOCOL_KO.md](docs/OLP_H_EXPERIMENT_PROTOCOL_KO.md) | Full experiment protocol (Korean) |
-| [docs/OLP_H_DIFF_REPORT_EN.md](docs/OLP_H_DIFF_REPORT_EN.md) | What changed relative to NoPoSplat |
+```bash
+# full RealEstate10K test split; --split test uses the 500-scene held-out index from the YAML
+python scripts/run_retention.py --config my_retention.yaml eval-grid \
+    --checkpoint /path/to/ours_r50.ckpt \
+    --scores reliability_filtered --ratios 0.25 0.5 0.75 --local on --split full --execute
 
-## Team
+# collect every run into one CSV
+python scripts/run_retention.py --config my_retention.yaml summarize \
+    --root /path/to/outputs --output results.csv
+```
 
-**Junyoung Kwon** ([@junyoung6215](https://github.com/junyoung6215)) · **Kyoosuk Hwang**<br>
-Capstone Design, Seoul National University of Science and Technology (SeoulTech), 2026.
+Unit tests run on CPU without data:
 
-## Acknowledgements
+```bash
+python -B -m unittest discover -s tests -p 'test_*.py' -v
+```
 
-This project is built on [NoPoSplat](https://github.com/cvg/NoPoSplat) by Ye et al., which in turn builds on
-[pixelSplat](https://github.com/dcharatan/pixelsplat), [DUSt3R](https://github.com/naver/dust3r) /
-[MASt3R](https://github.com/naver/mast3r) and [CroCo](https://github.com/naver/croco). We thank the authors
-for releasing their code and models.
+## Code structure
+
+```text
+src/model/encoder/heads/latent_preconditioner.py   ① OLP-H
+src/model/encoder/heads/dpt_gs_head.py             ② Gaussian heads + reliability branch
+src/loss/loss_reliability.py                       ② context-residual reliability loss
+src/model/gaussian_retention.py                    ③ retention: budgets, scores, r filter, budget loss
+src/model/local_cell_retention.py                  ③ cell layout and stratified ranking
+src/model/model_wrapper.py                         ④ retention in training and evaluation
+src/experiment_runner/retention.py                 train / eval-grid / summarize launcher
+config/                                            Hydra configs (all components off by default)
+docs/                                              design notes and implementation reports
+```
+
+## Limitations and future work
+
+- Our 50% model is still 0.44–0.47 dB below a control fine-tuned for the same steps without pruning.
+- At 50% and below, LPIPS is slightly worse than the unpruned base; the largest drops appear on thin structures and
+  high-frequency texture (still under analysis).
+- *r* is a reliability score, not a pruning score. Next steps: a pruning-specific score, size (MB) and FPS
+  measurements, more input views, and other backbones.
+
+## Citation
 
 ```bibtex
-@article{ye2024noposplat,
-  title   = {No Pose, No Problem: Surprisingly Simple 3D Gaussian Splats from Sparse Unposed Images},
-  author  = {Ye, Botao and Liu, Sifei and Xu, Haofei and Li, Xueting and Pollefeys, Marc and Yang, Ming-Hsuan and Peng, Songyou},
-  journal = {arXiv preprint arXiv:2410.24207},
-  year    = {2024}
+@misc{hwang2026stratified,
+  title        = {Stratified Retention for Compact Pose-free Feed-forward 3D Gaussian Splatting},
+  author       = {Hwang, Kyoosuk and Kwon, Junyoung},
+  year         = {2026},
+  howpublished = {\url{https://github.com/junyoung6215/olph-reliability-splat}},
+  note         = {Capstone Design project, Seoul National University of Science and Technology}
 }
 ```
 
+## Acknowledgements
+
+This code builds on [NoPoSplat](https://github.com/cvg/NoPoSplat), which provides the pose-free backbone, data pipeline
+and pretrained checkpoint, and in turn on [pixelSplat](https://github.com/dcharatan/pixelsplat),
+[DUSt3R](https://github.com/naver/dust3r) and [CroCo](https://github.com/naver/croco). We thank the authors for
+releasing their code.
+
 ## License
 
-MIT — see [LICENSE](LICENSE). The original NoPoSplat code is © 2024 Botao Ye; the OLP-H and reliability
-extensions are © 2026 Junyoung Kwon and Kyoosuk Hwang.
+Released under the [MIT License](LICENSE). The base code is © 2024 Botao Ye; our extensions are © 2026 Kyoosuk Hwang and
+Junyoung Kwon.

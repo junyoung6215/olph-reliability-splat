@@ -15,8 +15,12 @@ with annotation_only_jaxtyping():
         GaussianRetention,
         GaussianRetentionCfg,
         deterministic_random_scores,
+        filtered_random_scores,
         flatten_gaussian_scores,
         gather_gaussians,
+        merge_into_kept,
+        retention_budget_loss,
+        retention_budget_weight,
     )
     from src.model.types import Gaussians
 
@@ -258,6 +262,61 @@ def test_fixed_count_requires_an_explicit_budget() -> None:
         raise AssertionError("Expected fixed_count without keep_count to fail.")
 
 
+def test_merge_folds_dropped_gaussians_into_nearest_kept_of_cell() -> None:
+    # Two cells of two: [0, 1] and [2, 3]; keep 0 and 3.
+    means = torch.tensor([[[0.0, 0, 0], [2.0, 0, 0], [10.0, 0, 0], [12.0, 0, 0]]])
+    opacities = torch.tensor([[0.5, 0.5, 0.2, 0.6]], requires_grad=True)
+    gaussians = Gaussians(
+        means=means,
+        covariances=torch.eye(3).expand(1, 4, 3, 3).clone(),
+        harmonics=torch.arange(4.0).reshape(1, 4, 1, 1).expand(1, 4, 3, 1).clone(),
+        opacities=opacities,
+    )
+    merged = merge_into_kept(
+        gaussians, torch.tensor([[0, 3]]), torch.tensor([0, 0, 1, 1])
+    )
+    torch.testing.assert_close(merged.means[0, :, 0], torch.tensor([1.0, 11.5]), atol=1e-4, rtol=0)
+    # Unit covariance plus the spread of the merged centers along x.
+    torch.testing.assert_close(merged.covariances[0, 0, 0, 0], torch.tensor(2.0), atol=1e-4, rtol=0)
+    torch.testing.assert_close(merged.covariances[0, 0, 1, 1], torch.tensor(1.0), atol=1e-4, rtol=0)
+    torch.testing.assert_close(merged.harmonics[0, :, 0, 0], torch.tensor([0.5, 2.75]), atol=1e-4, rtol=0)
+    torch.testing.assert_close(merged.opacities, torch.tensor([[0.75, 0.68]]), atol=1e-4, rtol=0)
+    merged.opacities.sum().backward()
+    assert bool((opacities.grad != 0).all())
+
+
+def test_filtered_random_scores_rank_low_reliability_last() -> None:
+    reliability = torch.tensor([[0.9, 0.1, 0.6, 0.3]])
+    random = torch.tensor([[0.2, 0.9, 0.1, 0.8]])
+    scores = filtered_random_scores(reliability, random, floor=0.5)
+    order = scores.argsort(dim=1, descending=True)[0].tolist()
+    # Reliable Gaussians first (by random), then unreliable ones (by random).
+    assert order == [0, 2, 1, 3]
+
+
+def test_budget_loss_splits_each_cell_into_kept_and_dropped() -> None:
+    reliability = torch.tensor([[0.9, 0.2, 0.4, 0.8]], requires_grad=True)
+    cell_ids = torch.tensor([0, 0, 1, 1])
+    loss, stats = retention_budget_loss(reliability, cell_ids, 2, keep_ratio=0.5, r_min=0.05)
+    assert torch.isclose(stats["kept_mean"], torch.tensor(0.85))
+    assert torch.isclose(stats["dropped_mean"], torch.tensor(0.3))
+    # Each cell drops its lower half (0.2, 0.4) and keeps the upper (0.9, 0.8).
+    assert torch.isclose(loss, torch.tensor((0.15 + 0.35) / 2 + (0.1 + 0.2) / 2))
+    loss.backward()
+    assert reliability.grad.tolist() == [[-0.5, 0.5, 0.5, -0.5]]
+
+
+def test_budget_weight_ramps_over_soft_phase_then_scales() -> None:
+    cfg = GaussianRetentionCfg(budget_weight=0.01, start_step=1000)
+    assert retention_budget_weight(cfg, 500) == 0.01
+    cfg = GaussianRetentionCfg(
+        budget_weight=0.01, start_step=1000, budget_warmup=True, budget_hard_scale=0.1
+    )
+    assert retention_budget_weight(cfg, 0) == 0.0
+    assert abs(retention_budget_weight(cfg, 500) - 0.005) < 1e-12
+    assert abs(retention_budget_weight(cfg, 1000) - 0.001) < 1e-12
+
+
 def load_tests(loader, suite, pattern):
     return add_function_tests(suite, globals())
 
@@ -278,3 +337,4 @@ if __name__ == "__main__":
     test_elastic_threshold_rejects_variable_length_batch()
     test_non_finite_scores_fail_fast()
     test_fixed_count_requires_an_explicit_budget()
+    test_merge_folds_dropped_gaussians_into_nearest_kept_of_cell()
